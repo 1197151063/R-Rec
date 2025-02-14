@@ -8,7 +8,7 @@ import world
 from procedure import train_bpr_sgl,test
 import utils
 import torch.nn.functional as F
-from torch_geometric.utils import dropout_edge
+from torch_geometric.utils import dropout_edge,dropout_node,dropout_path
 import time
 if world.config['dataset'] == 'yelp2018':
     config = {
@@ -22,6 +22,7 @@ if world.config['dataset'] == 'yelp2018':
         'ssl_tmp':0.2,#TEMPERATURE
         'ssl_decay':0.1,#SSL_STRENGTH
         'drop_ratio':0.1,#EDGE_DROP_RATIO
+        'type':'ED',#GRAPH AUG TYPE
     }
 if world.config['dataset'] == 'amazon-book':
     config = {
@@ -35,6 +36,7 @@ if world.config['dataset'] == 'amazon-book':
         'ssl_tmp':0.2,#TEMPERATURE
         'ssl_decay':0.5,#SSL_STRENGTH
         'drop_ratio':0.1,#EDGE_DROP_RATIO
+        'type':'ED',#GRAPH AUG TYPE
     }
 
 if world.config['dataset'] == 'gowalla':
@@ -47,8 +49,9 @@ if world.config['dataset'] == 'gowalla':
         'lr':1e-3,#LEARNING_RATE
         'seed':0,#RANDOM_SEED
         'ssl_tmp':0.2,#TEMPERATURE
-        'ssl_decay':0.05,#SSL_STRENGTH
-        'drop_ratio':0.2,#EDGE_DROP_RATIO
+        'ssl_decay':0.0001,#SSL_STRENGTH
+        'drop_ratio':0.1,#EDGE_DROP_RATIO
+        'type':'ED',#GRAPH AUG TYPE
     }
 
 if world.config['dataset'] == 'iFashion':
@@ -63,6 +66,7 @@ if world.config['dataset'] == 'iFashion':
         'ssl_tmp':0.5,#TEMPERATURE
         'ssl_decay':0.02,#SSL_STRENGTH
         'drop_ratio':0.4,#EDGE_DROP_RATIO
+        'type':'RW',#GRAPH AUG TYPE
     }
 class SGL(RecModel):
     def __init__(self,
@@ -83,9 +87,7 @@ class SGL(RecModel):
                                      embedding_dim=config['dim'])
         self.item_emb = nn.Embedding(num_embeddings=num_items,
                                      embedding_dim=config['dim'])
-        #SGL use normal distribution of 0.01
-        nn.init.xavier_normal_(self.user_emb.weight,0.01)
-        nn.init.xavier_normal_(self.item_emb.weight,0.01)
+        self.init_weight()
         if isinstance(self.alpha, Tensor):
             assert self.alpha.size(0) == self.K + 1
         else:
@@ -94,9 +96,16 @@ class SGL(RecModel):
         self.ssl_decay = config['ssl_decay']    
         print('Go SGL')
         print(f"params settings: \n emb_size:{config['dim']}\n L2 reg:{config['decay']}\n layer:{self.K}")
-        print(f" ssl_tmp:{config['ssl_tmp']}\n ssl_decay:{config['ssl_decay']}\n graph aug type: edge drop")
+        print(f" ssl_tmp:{config['ssl_tmp']}\n ssl_decay:{config['ssl_decay']}\n graph aug type:{config['type']}")
 
-    
+    def init_weight(self):
+        if config['init'] == 'normal':
+            nn.init.normal_(self.user_emb.weight,std=config['init_weight'])
+            nn.init.normal_(self.item_emb.weight,std=config['init_weight'])
+        else:
+            nn.init.xavier_uniform_(self.user_emb.weight,gain=config['init_weight'])
+            nn.init.xavier_uniform_(self.item_emb.weight,gain=config['init_weight'])
+
     def get_embedding(self):
         x_u=self.user_emb.weight
         x_i=self.item_emb.weight
@@ -192,13 +201,21 @@ max_score = 0.
 
 for epoch in range(1, 1001):
     edge_index = train_edge_index
-    edge_index1,_ = dropout_edge(edge_index=edge_index,p=config['drop_ratio'])
-    edge_index2,_ = dropout_edge(edge_index=edge_index,p=config['drop_ratio'])
+    start_time = time.time()
+    if config['type'] == 'ED':
+        edge_index1,_ = dropout_edge(edge_index=edge_index,p=config['drop_ratio'])
+        edge_index2,_ = dropout_edge(edge_index=edge_index,p=config['drop_ratio'])
+    if config['type'] == 'ND':
+        edge_index1,_,_ = dropout_node(edge_index=edge_index,p=config['drop_ratio'])
+        edge_index2,_,_ = dropout_node(edge_index=edge_index,p=config['drop_ratio'])
+    if config['type'] == 'RW':
+        edge_index1,_ = dropout_path(edge_index=edge_index,p=config['drop_ratio'])
+        edge_index2,_ = dropout_path(edge_index=edge_index,p=config['drop_ratio'])
+        
     edge_index1 = model.get_sparse_graph(edge_index1)
     edge_index2 = model.get_sparse_graph(edge_index2)
     edge_index1 = gcn_norm(edge_index1)
     edge_index2 = gcn_norm(edge_index2)
-    start_time = time.time()
     loss = train_bpr_sgl(dataset=dataset,
                          model=model,
                          opt=opt,
