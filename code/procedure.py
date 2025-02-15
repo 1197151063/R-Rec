@@ -8,7 +8,7 @@ import multiprocessing
 from model import RecModel
 device = world.device
 config = world.config
-CORES = multiprocessing.cpu_count() // 2
+
 """
 define evaluation metrics here
 Already implemented:[Recall@K,NDCG@K]

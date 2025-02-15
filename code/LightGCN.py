@@ -7,14 +7,51 @@ from dataloader import Loader
 import world
 from procedure import train_bpr,test
 import utils
+import time
 
-config = {
-    'K':3,#GCN_LAYER
-    'dim':64,#EMBEDDING_SIZE
-    'decay':1e-4,#L2_NORM
-    'lr':1e-3,#LEARNING_RATE
-    'seed':0,#RANDOM_SEED
-}
+if world.config['dataset'] == 'yelp2018':
+    config = {
+        'init':'normal',#NORMAL DISTRIBUTION
+        'init_weight':0.1,#INIT WEIGHT
+        'K':4,#GCN_LAYER
+        'dim':64,#EMBEDDING_SIZE
+        'decay':1e-4,#L2_NORM
+        'lr':1e-3,#LEARNING_RATE
+        'seed':0,#RANDOM_SEED
+    }
+
+if world.config['dataset'] == 'amazon-book':
+    config = {
+        'init':'normal',#NORMAL DISTRIBUTION
+        'init_weight':0.1,#INIT WEIGHT
+        'K':3,#GCN_LAYER
+        'dim':64,#EMBEDDING_SIZE
+        'decay':1e-4,#L2_NORM
+        'lr':1e-3,#LEARNING_RATE
+        'seed':0,#RANDOM_SEED
+    }
+
+if world.config['dataset'] == 'gowalla':
+    config = {
+        'init':'normal',#NORMAL DISTRIBUTION
+        'init_weight':0.1,#INIT WEIGHT
+        'K':3,#GCN_LAYER
+        'dim':64,#EMBEDDING_SIZE
+        'decay':1e-4,#L2_NORM
+        'lr':1e-3,#LEARNING_RATE
+        'seed':0,#RANDOM_SEED
+    }
+
+if world.config['dataset'] == 'iFashion':
+    config = {
+        'init':'uniform',#UNIFORM DISTRIBUTION
+        'init_weight':1,#INIT WEIGHT
+        'K':3,#GCN_LAYER
+        'dim':64,#EMBEDDING_SIZE
+        'decay':1e-4,#L2_NORM
+        'lr':5e-4,#LEARNING_RATE
+        'seed':0,#RANDOM_SEED
+    }
 
 class LightGCN(RecModel):
     def __init__(self,
@@ -32,7 +69,7 @@ class LightGCN(RecModel):
                                      embedding_dim=config['dim'])
         self.item_emb = nn.Embedding(num_embeddings=num_items,
                                      embedding_dim=config['dim'])
-        self.init_weight(1e-1)
+        self.init_weight()
         self.K = config['K']
         edge_index = self.get_sparse_graph(edge_index=edge_index,use_value=False,value=None)
         self.edge_index = gcn_norm(edge_index)
@@ -44,9 +81,13 @@ class LightGCN(RecModel):
         print('Go LightGCN')
         print(f"params settings: \n emb_size:{config['dim']}\n L2 reg:{config['decay']}\n layer:{self.K}")
 
-    def init_weight(self,init_weight):
-        nn.init.normal_(self.user_emb.weight,std=init_weight)
-        nn.init.normal_(self.item_emb.weight,std=init_weight)
+    def init_weight(self):
+        if config['init'] == 'normal':
+            nn.init.normal_(self.user_emb.weight,std=config['init_weight'])
+            nn.init.normal_(self.item_emb.weight,std=config['init_weight'])
+        else:
+            nn.init.xavier_uniform_(self.user_emb.weight,gain=config['init_weight'])
+            nn.init.xavier_uniform_(self.item_emb.weight,gain=config['init_weight'])
         
     def get_embedding(self):
         x_u=self.user_emb.weight
@@ -83,10 +124,13 @@ best = 0.
 patience = 0.
 max_score = 0.
 for epoch in range(1, 1001):
+    start_time = time.time()
     loss = train_bpr(dataset=dataset,model=model,opt=opt)
+    end_time = time.time()
     recall,ndcg = test([20],model,train_edge_index,test_edge_index,num_users)
     flag,best,patience = utils.early_stopping(recall[20],ndcg[20],best,patience,model)
     if flag == 1:
         break
     print(f'Epoch: {epoch:03d}, {loss}, R@20: '
-          f'{recall[20]:.4f}, N@20: {ndcg[20]:.4f} ')
+          f'{recall[20]:.4f}, N@20: {ndcg[20]:.4f}, '
+          f'time:{end_time-start_time:.2f} seconds')

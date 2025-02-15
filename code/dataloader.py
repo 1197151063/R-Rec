@@ -54,10 +54,6 @@ class Loader(Dataset):
 
 
         edge_index = torch.cat((train_edge_index,test_edge_index),1)
-        self.testUser = np.array(testUser)
-        self.testItem = np.array(testItem)
-        self.trainUser = np.array(trainUser)
-        self.trainItem = np.array(trainItem)
         self.train_edge_index = train_edge_index
         self.edge_index = edge_index
         self.n_user = edge_index[0].max() + 1
