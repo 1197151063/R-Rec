@@ -5,21 +5,26 @@ from torch_geometric.nn.conv.gcn_conv import gcn_norm
 import torch
 from dataloader import Loader
 import world
-from procedure import train_bpr_sgl,test
+from procedure import test
 import utils
 import torch.nn.functional as F
-from torch_geometric.utils import dropout_edge
+from torch_sparse import SparseTensor,matmul
+import time
+
 
 if world.config['dataset'] == 'yelp2018':
     config = {
-        'K':3,#GCN_LAYER
+        'init':'normal',#NORMAL DISTRIBUTION
+        'init_weight':0.01,#INIT WEIGHT
+        'K':2,#GCN_LAYER
         'dim':64,#EMBEDDING_SIZE
-        'decay':1e-4,#L2_NORM
+        'decay':1e-5,#L2_NORM
         'lr':1e-3,#LEARNING_RATE
         'seed':0,#RANDOM_SEED
         'ssl_tmp':0.2,#TEMPERATURE
-        'ssl_decay':0.1,#SSL_STRENGTH
-        'drop_ratio':0.1,#EDGE_DROP_RATIO
+        'ssl_decay':1e-5,#SSL_STRENGTH
+        'aug_ratio':0.1,#ADDING EDGE RATIO
+        'prune_threshold': 0.02
     }
 if world.config['dataset'] == 'amazon-book':
     config = {
@@ -56,8 +61,7 @@ class RGCF(RecModel):
                          config=config)
         self.K = config['K']
         self.num_interactions = edge_index.size(1)
-        self.edge_index = self.get_sparse_graph(edge_index,use_value=False,value=None)
-        self.edge_index_C = gcn_norm(self.edge_index)        
+        self.edge_index = edge_index  
         self.alpha= 1./ (1 + self.K)
         self.user_emb = nn.Embedding(num_embeddings=num_users,
                                      embedding_dim=config['dim'])
@@ -68,11 +72,18 @@ class RGCF(RecModel):
             assert self.alpha.size(0) == self.K + 1
         else:
             self.alpha = torch.tensor([self.alpha] * (self.K + 1))
+        self.prune_threshold = config['prune_threshold']
         self.ssl_tmp = config['ssl_tmp']
-        self.ssl_decay = config['ssl_decay']    
+        self.ssl_decay = config['ssl_decay'] 
+        self.aug_ratio = config['aug_ratio'] 
+        self.ssl_decay = config['ssl_decay']  
+        self.value = None
+        self.aug_graph = None
+        self.edge_index_sp = self.get_sparse_graph(edge_index)
+        self.edge_index_norm = None
         print('Go RGCF')
         print(f"params settings: \n emb_size:{config['dim']}\n L2 reg:{config['decay']}\n layer:{self.K}")
-        print(f" ssl_tmp:{config['ssl_tmp']}\n ssl_decay:{config['ssl_decay']}\n graph aug type: edge drop")
+        print(f" ssl_tmp:{config['ssl_tmp']}\n ssl_decay:{config['ssl_decay']}\n pruning threshold:{config['prune_threshold']}")
 
     def init_weight(self):
         if config['init'] == 'normal':
@@ -82,28 +93,101 @@ class RGCF(RecModel):
             nn.init.xavier_uniform_(self.user_emb.weight,gain=config['init_weight'])
             nn.init.xavier_uniform_(self.item_emb.weight,gain=config['init_weight'])
     
-    def get_embedding(self):
+    def get_hidden_emb(self):
         x_u=self.user_emb.weight
         x_i=self.item_emb.weight
         x=torch.cat([x_u,x_i])
+        x = self.propagate(edge_index=self.edge_index_sp,x=x)
+        out_u,out_i = torch.split(x,[self.num_users,self.num_items])
+        return out_u, out_i
+    
+    def cal_cos_sim_sp(self,edge_index,a,b,eps=1e-8,CHUNK_SIZE=65536):
+        a_n, b_n = a.norm(dim=1)[:,None],b.norm(dim=1)[:,None]
+        a_norm = a / torch.max(a_n,eps * torch.ones_like(a_n))
+        b_norm = b / torch.max(b_n,eps * torch.ones_like(b_n))
+        sims = torch.zeros(edge_index.size(1),dtype=a.dtype).to(device)
+        for idx in range(0,edge_index.size(1),CHUNK_SIZE):
+            batch_row_index = edge_index[0][idx:idx+CHUNK_SIZE]
+            batch_col_index = edge_index[1][idx:idx+CHUNK_SIZE]
+            a_batch = torch.index_select(a_norm, 0, batch_row_index)
+            b_batch = torch.index_select(b_norm, 0, batch_col_index)
+            dot_prods = torch.mul(a_batch, b_batch).sum(1)
+            sims[idx:idx + CHUNK_SIZE] = dot_prods
+        return sims
+    
+    def cal_cos_sim(self,u_idx, i_idx, CHUNK_SIZE=65536):
+        user_feature,item_feature = self.get_hidden_emb()
+        L = u_idx.shape[0]
+        sims = torch.zeros(L, dtype=user_feature.dtype).to(world.device)
+        for idx in range(0, L, CHUNK_SIZE):
+            a_batch = torch.index_select(user_feature, 0, u_idx[idx:idx + CHUNK_SIZE])
+            b_batch = torch.index_select(item_feature, 0, i_idx[idx:idx + CHUNK_SIZE])
+            dot_prods = torch.mul(a_batch, b_batch).sum(1)
+            sims[idx:idx + CHUNK_SIZE] = dot_prods
+        return sims
+    
+    def graph_denoising(self):
+        with torch.no_grad():
+            hidden_user,hidden_item = self.get_hidden_emb()
+            cos_sim = self.cal_cos_sim_sp(self.edge_index,hidden_user,hidden_item)
+            cos_sim = (cos_sim + 1) / 2 
+            cos_sim[cos_sim < self.prune_threshold] = 0
+            self.value = cos_sim
+            self.edge_index_norm = gcn_norm(self.edge_index_to_sparse_tensor(self.edge_index,cos_sim))
+        
+    def graph_augmentation(self):
+        with torch.no_grad():
+            num_edges = self.edge_index.size(1)
+            aug_user = torch.randint(0, self.num_users,(int(self.aug_ratio * num_edges),), device=device)
+            aug_item = torch.randint(0, self.num_items,(int(self.aug_ratio * num_edges),), device=device)
+            cos_sim = self.cal_cos_sim(aug_user,aug_item)
+            _, idx = torch.topk(cos_sim, int(self.aug_ratio * num_edges))
+            aug_user = aug_user[idx].long()
+            aug_item = aug_item[idx].long()
+            aug_edge_index = torch.stack([aug_user,aug_item])
+            aug_value = torch.ones_like(aug_user,device=device) * torch.median(self.value)
+            aug_edge_index = torch.cat([self.edge_index, aug_edge_index], dim=1)
+            aug_value = torch.cat([self.value,aug_value],dim=0)
+            self.aug_graph = gcn_norm(self.edge_index_to_sparse_tensor(aug_edge_index,aug_value))
+        
+    def edge_index_to_sparse_tensor(self,edge_index,value):
+        r,c = edge_index
+        row_index = torch.cat([r , c + self.num_users])
+        col_index = torch.cat([c + self.num_users ,r])
+        value = torch.cat([value,value])
+        return SparseTensor(row=row_index,col=col_index,value=value,sparse_sizes=(self.num_items + self.num_users , self.num_users + self.num_items))
+    
+    def forward(self):
+        edge_index_C = self.edge_index_norm
+        out = self.get_ssl_embedding(edge_index=edge_index_C)
+        out_u,out_i = torch.split(out,[self.num_users,self.num_items])
+        return out_u, out_i
+    
+    def ssl_forward(self):
+        edge_index_C = self.aug_graph
+        out = self.get_ssl_embedding(edge_index=edge_index_C)
+        out_u,out_i = torch.split(out,[self.num_users,self.num_items])
+        return out_u, out_i
+
+    def get_embedding(self):
+        x_u,x_i = self.get_hidden_emb()
+        x=torch.cat([x_u,x_i])
         out = x * self.alpha[0]
         for i in range(self.K):
-            x = self.propagate(edge_index=self.edge_index,x=x)
+            x = self.propagate(edge_index=self.edge_index_norm,x=x)
             out = out + x * self.alpha[i + 1]
         return out
     
-    def forward(self,
-                edge_label_index:Tensor):
-        out = self.get_embedding()
-        out_u,out_i = torch.split(out,[self.num_users,self.num_items])
+    def bpr_loss(self,out_u,out_i,edge_label_index):
         out_src = out_u[edge_label_index[0]]
         out_dst = out_i[edge_label_index[1]]
         out_dst_neg = out_i[edge_label_index[2]]
-        return (out_src * out_dst).sum(dim=-1) ,(out_src * out_dst_neg).sum(dim=-1) 
+        pos_rank = (out_src * out_dst).sum(dim=-1)
+        neg_rank = (out_src * out_dst_neg).sum(dim=-1) 
+        return torch.nn.functional.softplus(neg_rank - pos_rank).mean()
 
     def get_ssl_embedding(self,edge_index):
-        x_u=self.user_emb.weight
-        x_i=self.item_emb.weight
+        x_u,x_i = self.get_hidden_emb()
         x=torch.cat([x_u,x_i])
         out = x * self.alpha[0]
         for i in range(self.K):
@@ -111,50 +195,24 @@ class RGCF(RecModel):
             out = out + x * self.alpha[i + 1]
         return out
 
-    def ssl_loss(self,
-                    edge_index1,
-                    edge_index2,
-                    edge_label_index):
-        info_out1 = self.get_ssl_embedding(edge_index1)
-        info_out2 = self.get_ssl_embedding(edge_index2)
-        info_out_u_1,info_out_i_1 = torch.split(info_out1,[self.num_users,self.num_items])
-        info_out_u_2,info_out_i_2 = torch.split(info_out2,[self.num_users,self.num_items])
-        u_idx = torch.unique(edge_label_index[0])
-        i_idx = torch.unique(edge_label_index[1])
-        info_out_u1 = info_out_u_1[u_idx]
-        info_out_u2 = info_out_u_2[u_idx]
-        info_out_i1 = info_out_i_1[i_idx]
-        info_out_i2 = info_out_i_2[i_idx]
-        info_out_u1 = F.normalize(info_out_u1,dim=1)
-        info_out_u2 = F.normalize(info_out_u2,dim=1)
-        info_out_u_2 = F.normalize(info_out_u_2,dim=1)
-        info_out_i_2 = F.normalize(info_out_i_2,dim=1)
-        info_pos_user = (info_out_u1 * info_out_u2).sum(dim=1)/ self.ssl_tmp
-        info_pos_user = torch.exp(info_pos_user)
-        info_neg_user = (info_out_u1 @ info_out_u_2.t())/ self.ssl_tmp
-        info_neg_user = torch.exp(info_neg_user)
-        info_neg_user = torch.sum(info_neg_user,dim=1,keepdim=True)
-        info_neg_user = info_neg_user.T
-        ssl_logits_user = -torch.log(info_pos_user / info_neg_user).mean()
-        info_out_i1 = F.normalize(info_out_i1,dim=1)
-        info_out_i2 = F.normalize(info_out_i2,dim=1)
-        info_pos_item = (info_out_i1 * info_out_i2).sum(dim=1)/ self.ssl_tmp
-        info_neg_item = (info_out_i1 @ info_out_i_2.t())/ self.ssl_tmp
-        info_pos_item = torch.exp(info_pos_item)
-        info_neg_item = torch.exp(info_neg_item)
-        info_neg_item = torch.sum(info_neg_item,dim=1,keepdim=True)
-        info_neg_item = info_neg_item.T
-        ssl_logits_item = -torch.log(info_pos_item / info_neg_item).mean()
-        return self.ssl_decay * (ssl_logits_user + ssl_logits_item)
+    def ssl_triple_loss(self, z1: torch.Tensor, z2: torch.Tensor, all_emb: torch.Tensor):
+        norm_emb1 = F.normalize(z1)
+        norm_emb2 = F.normalize(z2)
+        norm_all_emb = F.normalize(all_emb)
+        pos_score = torch.mul(norm_emb1, norm_emb2).sum(dim=1)
+        ttl_score = torch.matmul(norm_emb1, norm_all_emb.transpose(0, 1))
+        pos_score = torch.exp(pos_score / self.ssl_tmp)
+        ttl_score = torch.exp(ttl_score / self.ssl_tmp).sum(dim=1)
+        ssl_loss = -torch.log(pos_score / ttl_score).sum()
+        return self.ssl_decay * ssl_loss
     
-    def bpr_loss(self,pos_rank,neg_rank):
-        return F.softplus(neg_rank - pos_rank).mean()
     
     def L2_reg(self,edge_label_index):
+        user_emb,item_emb = self.get_hidden_emb()
         u_idx,i_idx_pos,i_idx_neg = edge_label_index
-        userEmb0 = self.user_emb.weight[u_idx]
-        posEmb0 = self.item_emb.weight[i_idx_pos]
-        negEmb0 = self.item_emb.weight[i_idx_neg]
+        userEmb0 = user_emb[u_idx]
+        posEmb0 = item_emb[i_idx_pos]
+        negEmb0 = item_emb[i_idx_neg]
         reg_loss = (1/2)*(userEmb0.norm(2).pow(2) + posEmb0.norm(2).pow(2) +
                          negEmb0.norm(2).pow(2)) / edge_label_index.size(1)
         regularization = self.config['decay'] * reg_loss
@@ -166,7 +224,7 @@ train_edge_index = dataset.train_edge_index.to(device)
 test_edge_index = dataset.test_edge_index.to(device)
 num_users = dataset.num_users
 num_items = dataset.num_items
-model = SGL(num_users=num_users,
+model = RGCF(num_users=num_users,
                  num_items=num_items,
                  edge_index=train_edge_index,
                  config=config).to(device)
@@ -175,23 +233,43 @@ best = 0.
 patience = 0.
 max_score = 0.
 
+def train_bpr_rgcf(dataset,
+                  model:RGCF,
+                  opt):
+    model = model
+    model.train()
+    S = utils.Full_Sampling(dataset=dataset)
+    aver_loss = 0.
+    total_batch = len(S)
+    for edge_label_index in S:
+        out_u,out_i = model.forward()
+        aug_u,_ = model.ssl_forward()
+        all_u,_ = model.get_hidden_emb()
+        bpr_loss = model.bpr_loss(out_u,out_i,edge_label_index)
+        ssl_loss = model.ssl_triple_loss(out_u[edge_label_index[0]],aug_u[edge_label_index[0]],all_u)
+        L2_reg = model.L2_reg(edge_label_index)
+        loss = bpr_loss + ssl_loss + L2_reg 
+        opt.zero_grad()
+        loss.backward()
+        opt.step()    
+        aver_loss += (bpr_loss + ssl_loss + L2_reg)
+    aver_loss /= total_batch
+    return f"average loss {aver_loss:5f}"
+
+
 for epoch in range(1, 1001):
     edge_index = train_edge_index
-    edge_index1,_ = dropout_edge(edge_index=edge_index,p=config['drop_ratio'])
-    edge_index2,_ = dropout_edge(edge_index=edge_index,p=config['drop_ratio'])
-    edge_index1 = model.get_sparse_graph(edge_index1)
-    edge_index2 = model.get_sparse_graph(edge_index2)
-    edge_index1 = gcn_norm(edge_index1)
-    edge_index2 = gcn_norm(edge_index2)
-    loss = train_bpr_sgl(dataset=dataset,
+    model.graph_denoising()
+    model.graph_augmentation()
+    start_time = time.time()
+    loss = train_bpr_rgcf(dataset=dataset,
                          model=model,
-                         opt=opt,
-                         edge_index1=edge_index1,
-                         edge_index2=edge_index2)
-    recall,ndcg = test([20,50],model,train_edge_index,test_edge_index,num_users)
+                         opt=opt)
+    end_time = time.time()
+    recall,ndcg = test([20],model,train_edge_index,test_edge_index,num_users)
     flag,best,patience = utils.early_stopping(recall[20],ndcg[20],best,patience,model)
     if flag == 1:
         break
     print(f'Epoch: {epoch:03d}, {loss}, R@20: '
-          f'{recall[20]:.4f}, R@50: {recall[50]:.4f} '
-          f', N@20: {ndcg[20]:.4f}, N@50: {ndcg[50]:.4f}')
+          f'{recall[20]:.4f}, N@20: {ndcg[20]:.4f}, '
+          f'time:{end_time-start_time:.2f} seconds')

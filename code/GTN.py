@@ -1,7 +1,6 @@
 from model import RecModel
 from torch import LongTensor,Tensor
 import torch.nn as nn
-from torch_geometric.nn.conv.gcn_conv import gcn_norm
 from torch_geometric.typing import Adj
 import torch
 from dataloader import Loader
@@ -10,7 +9,7 @@ from procedure import train_bpr,test
 import utils
 import time
 import torch.nn.functional as F
-from torch_sparse import sum, mul, fill_diag, remove_diag,SparseTensor, matmul
+from torch_sparse import sum, mul, fill_diag, remove_diag,SparseTensor
 
 if world.config['dataset'] == 'yelp2018':
     config = {
@@ -33,6 +32,7 @@ if world.config['dataset'] == 'amazon-book':
         'decay':1e-4,#L2_NORM
         'lr':1e-3,#LEARNING_RATE
         'seed':0,#RANDOM_SEED
+        'lambda':1
     }
 
 if world.config['dataset'] == 'gowalla':
@@ -44,6 +44,7 @@ if world.config['dataset'] == 'gowalla':
         'decay':1e-4,#L2_NORM
         'lr':1e-3,#LEARNING_RATE
         'seed':0,#RANDOM_SEED
+        'lambda':4,
     }
 
 if world.config['dataset'] == 'iFashion':
@@ -55,6 +56,7 @@ if world.config['dataset'] == 'iFashion':
         'decay':1e-4,#L2_NORM
         'lr':1e-3,#LEARNING_RATE
         'seed':0,#RANDOM_SEED
+        'lambda':4
     }
 
 class GTN(RecModel):

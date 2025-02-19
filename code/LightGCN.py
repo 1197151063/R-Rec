@@ -9,6 +9,7 @@ from procedure import train_bpr,test
 import utils
 import time
 
+
 if world.config['dataset'] == 'yelp2018':
     config = {
         'init':'normal',#NORMAL DISTRIBUTION
@@ -44,12 +45,12 @@ if world.config['dataset'] == 'gowalla':
 
 if world.config['dataset'] == 'iFashion':
     config = {
-        'init':'uniform',#UNIFORM DISTRIBUTION
-        'init_weight':1,#INIT WEIGHT
+        'init':'normal',#Normal DISTRIBUTION
+        'init_weight':0.01,#INIT WEIGHT
         'K':3,#GCN_LAYER
         'dim':64,#EMBEDDING_SIZE
-        'decay':1e-4,#L2_NORM
-        'lr':5e-4,#LEARNING_RATE
+        'decay':1e-3,#L2_NORM
+        'lr':1e-3,#LEARNING_RATE
         'seed':0,#RANDOM_SEED
     }
 
@@ -99,14 +100,13 @@ class LightGCN(RecModel):
             out = out + x * self.alpha[i + 1]
         return out
     
-    def forward(self,
-                    edge_label_index:Tensor):
-            out = self.get_embedding()
-            out_u,out_i = torch.split(out,[self.num_users,self.num_items])
-            out_src = out_u[edge_label_index[0]]
-            out_dst = out_i[edge_label_index[1]]
-            out_dst_neg = out_i[edge_label_index[2]]
-            return (out_src * out_dst).sum(dim=-1),(out_src * out_dst_neg).sum(dim=-1)
+    def forward(self,edge_label_index:Tensor):
+        out = self.get_embedding()
+        out_u,out_i = torch.split(out,[self.num_users,self.num_items])
+        out_src = out_u[edge_label_index[0]]
+        out_dst = out_i[edge_label_index[1]]
+        out_dst_neg = out_i[edge_label_index[2]]
+        return (out_src * out_dst).sum(dim=-1),(out_src * out_dst_neg).sum(dim=-1)
     
 
 device = world.device
