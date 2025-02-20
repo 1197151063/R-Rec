@@ -9,9 +9,11 @@ from procedure import train_bpr_sgl,test
 import utils
 import torch.nn.functional as F
 from torch_geometric.utils import dropout_edge
-
+import time
 if world.config['dataset'] == 'yelp2018':
     config = {
+        'init':'normal',#NORMAL DISTRIBUTION
+        'init_weight':0.01,#INIT WEIGHT
         'K':3,#GCN_LAYER
         'dim':64,#EMBEDDING_SIZE
         'decay':1e-4,#L2_NORM
@@ -23,6 +25,8 @@ if world.config['dataset'] == 'yelp2018':
     }
 if world.config['dataset'] == 'amazon-book':
     config = {
+        'init':'normal',#NORMAL DISTRIBUTION
+        'init_weight':0.01,#INIT WEIGHT
         'K':3,#GCN_LAYER
         'dim':64,#EMBEDDING_SIZE
         'decay':1e-4,#L2_NORM
@@ -32,8 +36,11 @@ if world.config['dataset'] == 'amazon-book':
         'ssl_decay':0.5,#SSL_STRENGTH
         'drop_ratio':0.1,#EDGE_DROP_RATIO
     }
+
 if world.config['dataset'] == 'gowalla':
     config = {
+        'init':'normal',#NORMAL DISTRIBUTION
+        'init_weight':0.01,#INIT WEIGHT
         'K':3,#GCN_LAYER
         'dim':64,#EMBEDDING_SIZE
         'decay':1e-4,#L2_NORM
@@ -44,6 +51,19 @@ if world.config['dataset'] == 'gowalla':
         'drop_ratio':0.2,#EDGE_DROP_RATIO
     }
 
+if world.config['dataset'] == 'iFashion':
+    config = {
+        'init':'normal',#NORMAL DISTRIBUTION
+        'init_weight':0.01,#INIT WEIGHT
+        'K':3,#GCN_LAYER
+        'dim':64,#EMBEDDING_SIZE
+        'decay':1e-4,#L2_NORM
+        'lr':1e-3,#LEARNING_RATE
+        'seed':0,#RANDOM_SEED
+        'ssl_tmp':0.5,#TEMPERATURE
+        'ssl_decay':0.02,#SSL_STRENGTH
+        'drop_ratio':0.4,#EDGE_DROP_RATIO
+    }
 class SGL(RecModel):
     def __init__(self,
                  num_users:int,
@@ -178,15 +198,17 @@ for epoch in range(1, 1001):
     edge_index2 = model.get_sparse_graph(edge_index2)
     edge_index1 = gcn_norm(edge_index1)
     edge_index2 = gcn_norm(edge_index2)
+    start_time = time.time()
     loss = train_bpr_sgl(dataset=dataset,
                          model=model,
                          opt=opt,
                          edge_index1=edge_index1,
                          edge_index2=edge_index2)
+    end_time = time.time()
     recall,ndcg = test([20,50],model,train_edge_index,test_edge_index,num_users)
     flag,best,patience = utils.early_stopping(recall[20],ndcg[20],best,patience,model)
     if flag == 1:
         break
     print(f'Epoch: {epoch:03d}, {loss}, R@20: '
-          f'{recall[20]:.4f}, R@50: {recall[50]:.4f} '
-          f', N@20: {ndcg[20]:.4f}, N@50: {ndcg[50]:.4f}')
+          f'{recall[20]:.4f}, N@20: {ndcg[20]:.4f}, '
+          f'time:{end_time-start_time:.2f} seconds')
